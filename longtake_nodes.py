@@ -64,6 +64,16 @@ SEAM_FADE_FRAMES = 24
 SEAM_ANALYSIS_FRAMES = 4
 SEAM_MAX_EV = 0.25
 SEAM_MAX_CHROMA = 0.08
+# Tone of the anchor. The previous clip's latent tail is fed back as a clean
+# keyframe: every clip inherits the previous one's tone and adds its own bias, and
+# nothing pulls it back (measured over 11 clips: luminance -24 %, shadows crushed,
+# per-channel latent means drifting monotonically). The anchor is therefore
+# renormalised per channel towards clip 0 before it is handed over.
+#   source : clip 0's tone, plus whatever the source itself changed since clip 0
+#   clip0  : clip 0's tone as is (static scenes)
+ANCHOR_TONE_MODES = ["source", "clip0", "off"]
+ANCHOR_TONE_MAX_SHIFT = 0.5
+ANCHOR_TONE_MAX_GAIN = 1.15
 PROMPT_TEMPLATES = {
     "reference": "<Video 1> provides the full performance, motion, timing and camera. "
                  "<Picture 1> defines the identity and appearance of the subject.",
@@ -76,6 +86,7 @@ PROMPT_TEMPLATES = {
 }
 CACHE_SUBFOLDER = "h3_longtake"
 PLAN_FILE = "plan.json"
+TONE_FILE = "tone.json"
 
 
 # ----------------------------------------------------------------------------
@@ -527,6 +538,38 @@ def seam_match_fn(images, boundary, mode="color", fade=SEAM_FADE_FRAMES, ref=Non
     return out
 
 
+def _latent_tone(video):
+    """Per-channel mean/std of a video latent [B, C, T, H, W]."""
+    v = video[:1].double()
+    return {"mean": v.mean(dim=(0, 2, 3, 4)).tolist(), "std": v.std(dim=(0, 2, 3, 4)).tolist()}
+
+
+def anchor_tone_target(gen0, src0=None, src=None):
+    """Tone the anchor should have: clip 0's. With the source tones (of clip 0 and
+    of the clip the anchor comes from) it also follows what the source changed in
+    between, so a scene that really gets darker is not pulled back to clip 0."""
+    mean = torch.tensor(gen0["mean"], dtype=torch.float64)
+    std = torch.tensor(gen0["std"], dtype=torch.float64)
+    if src0 is not None and src is not None:
+        mean = mean + torch.tensor(src["mean"], dtype=torch.float64) - torch.tensor(src0["mean"], dtype=torch.float64)
+        std = std * torch.tensor(src["std"], dtype=torch.float64) / torch.tensor(src0["std"], dtype=torch.float64).clamp(min=1e-6)
+    return mean, std
+
+
+def anchor_tone_fix(prev_video, tone, target):
+    """Previous clip's latent with its per-channel tone moved onto `target`
+    (shift and gain clamped). `tone` is measured on the whole clip, not on the few
+    anchor tokens: the tail keeps its own deviation from the clip's mean, only the
+    clip-level drift is removed. Every clip is corrected against clip 0, so what
+    is left over does not accumulate along the chain."""
+    mean = torch.tensor(tone["mean"], dtype=torch.float64)
+    std = torch.tensor(tone["std"], dtype=torch.float64)
+    shift = (target[0] - mean).clamp(-ANCHOR_TONE_MAX_SHIFT, ANCHOR_TONE_MAX_SHIFT)
+    gain = (target[1] / std.clamp(min=1e-6)).clamp(1.0 / ANCHOR_TONE_MAX_GAIN, ANCHOR_TONE_MAX_GAIN)
+    m, s, g = (t.to(prev_video).reshape(1, -1, 1, 1, 1) for t in (mean, shift, gain))
+    return (prev_video - m) * g + m + s, float(shift.abs().max()), float(gain.min()), float(gain.max())
+
+
 def _tail_frames_from_mp4(path, total, n):
     """Last n frames of a chunk (for the seam match when the previous clip is cached)."""
     _, _, _, w, h = _probe_video_file(path)
@@ -936,6 +979,23 @@ def _save_plan(project_dir, payload):
         json.dump(payload, fh, indent=2)
 
 
+def _load_tones(project_dir):
+    """{clip index: {"gen": tone of the clip, "src": tone of its source slice}}"""
+    path = os.path.join(project_dir, TONE_FILE)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return {int(k): v for k, v in json.load(fh).items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_tones(project_dir, tones):
+    with open(os.path.join(project_dir, TONE_FILE), "w", encoding="utf-8") as fh:
+        json.dump({str(k): tones[k] for k in sorted(tones)}, fh)
+
+
 def _delete_clips_from(project_dir, first_index):
     removed = []
     for entry in os.listdir(project_dir):
@@ -1045,6 +1105,12 @@ class H3LongTakeRender:
                                                         "prompt ignored, references video->image as in the finetune, ref_image_1 only; "
                                                         "source_role must be reference. Recommended: steps 3, scheduler simple, "
                                                         "ModelSamplingMiniMaxH3 shift 3/3 upstream (= upstream sigmas 1, .857, .6, 0)."}),
+                "anchor_tone": (ANCHOR_TONE_MODES, {"default": "source",
+                                "tooltip": "Stops the tone drift along the chain (clips getting darker and more contrasted): the "
+                                           "previous clip's latent tail is renormalised per channel towards clip 0 before it becomes "
+                                           "the anchor. source: also follows what the source changed since clip 0 (recommended). "
+                                           "clip0: clip 0's tone as is, for static scenes. off: anchor untouched. "
+                                           "The correction leaves a small step at the seam: use seam_match = color or luminance."}),
             },
             "hidden": {"api_prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -1065,8 +1131,9 @@ class H3LongTakeRender:
         return float("nan")  # depends on what is on disk
 
     @classmethod
-    def VALIDATE_INPUTS(cls, source_file=None):
-        # files uploaded after startup are not in the combo list yet
+    def VALIDATE_INPUTS(cls, source_file=None, anchor_tone=None):
+        # files uploaded after startup are not in the combo list yet;
+        # anchor_tone: workflows saved before it existed hand it another widget's value (see render)
         if source_file and source_file != NO_FILE and not folder_paths.exists_annotated_filepath(source_file):
             return f"Video not found in input/: {source_file}"
         return True
@@ -1081,10 +1148,13 @@ class H3LongTakeRender:
                ref_image_size="match", ref_video_size="match", audio_context=True, chunk_crf=10,
                aspect="source", megapixels=0.5, prompt_text=None, start_seconds=0.0, end_seconds=0.0,
                anchor_mode="keyframe", source_role="reference", seam_match="off",
-               text_cond=None, api_prompt=None, extra_pnginfo=None):
+               text_cond=None, anchor_tone="source", api_prompt=None, extra_pnginfo=None):
 
         if source_role not in SOURCE_ROLES:
             raise ValueError(f"H3 LongTake: unknown source_role: {source_role}")
+        if anchor_tone not in ANCHOR_TONE_MODES:
+            # saved workflows map widgets by position: an older one puts a stray value here
+            anchor_tone = "source"
         # Viggle-Animate: ref2va finetune for character replacement, frozen text
         # embedding instead of Qwen; refs [video, image] as in the finetune
         viggle = text_cond is not None
@@ -1126,7 +1196,7 @@ class H3LongTakeRender:
             plan_report(plan, source.n_source, source.fps),
             f"output canvas {width}x{height} (aspect={aspect}, source {source.width}x{source.height}); "
             f"{n_refs} reference images; anchor {anchor_mode}, audio_context={bool(audio_context)}; "
-            f"source as {source_role}; seam_match={seam_match}",
+            f"source as {source_role}; seam_match={seam_match}; anchor_tone={anchor_tone}",
         ]
         if template_used:
             report_lines.append(f"empty prompt: using the {source_role} template: {prompt}")
@@ -1200,7 +1270,13 @@ class H3LongTakeRender:
             "source_offset_seconds": source.offset / float(FPS),
             "source_path": getattr(source, "path", None),
             "anchor_mode": anchor_mode, "audio_context": bool(audio_context),
+            "anchor_tone": anchor_tone,
         })
+        # tones of the clips on disk; the ones about to be redone are measured again
+        tones = {} if mode == "restart" else _load_tones(project_dir)
+        if mode == "redo_from":
+            tones = {k: v for k, v in tones.items() if k < int(redo_from_clip)}
+        _save_tones(project_dir, tones)
 
         # --- image references: encoded once ------------------------------------
         image_items, image_blocks = [], []
@@ -1235,6 +1311,15 @@ class H3LongTakeRender:
             report_lines.append(f"source {source.label}; guide latent at {int(width)}x{int(height)}")
         print("[H3 LongTake] start\n" + "\n".join(report_lines))
 
+        def source_tone(index):
+            # clips rendered before tone.json existed: their slice is encoded again, once
+            entry = tones.setdefault(index, {})
+            if "src" not in entry:
+                cc = clips[index]
+                tw, th = (int(width), int(height)) if use_guide else (cw, ch)
+                entry["src"] = _latent_tone(vae.encode(source.frames_at(cc["src_start"], cc["length"], tw, th)))
+            return entry["src"]
+
         # --- clip loop -----------------------------------------------------------
         pbar = comfy.utils.ProgressBar(len(clips))
         prev_video = prev_audio = None
@@ -1251,6 +1336,7 @@ class H3LongTakeRender:
                 saved = torch.load(latent_path, map_location="cpu")
                 prev_video, prev_audio = saved["video"], saved["audio"]
                 prev_tail, prev_tail_src = None, (mp4_path, int(saved.get("new", c["new"])))
+                tones.setdefault(i, {})["gen"] = _latent_tone(prev_video)
                 skipped.append(i)
                 pbar.update(1)
                 continue
@@ -1310,6 +1396,18 @@ class H3LongTakeRender:
                 })
             del frames
 
+            # tone of the anchor, here while the VAE is still the loaded model
+            src_tone = _latent_tone(z_guide if z_guide is not None else z_video)
+            anchor_video = prev_video
+            if i > 0 and anchor_tone != "off" and anchor_mode != "none":
+                if anchor_tone == "source":
+                    target = anchor_tone_target(tones[0]["gen"], source_tone(0), source_tone(i - 1))
+                else:
+                    target = anchor_tone_target(tones[0]["gen"])
+                anchor_video, shift, gain_lo, gain_hi = anchor_tone_fix(prev_video, tones[i - 1]["gen"], target)
+                print(f"[H3 LongTake] clip_{i:03d} anchor tone ({anchor_tone}): "
+                      f"shift up to {shift:.3f}, gain {gain_lo:.3f}..{gain_hi:.3f}")
+
             # With the DiT resident in VRAM the 25 GB Qwen can only stream from
             # RAM: the encode goes from ~1 min to ~10 min (measured). Evicting
             # costs nothing, the weights stay staged in RAM and are back in a second.
@@ -1344,7 +1442,7 @@ class H3LongTakeRender:
             elif anchor_mode == "inpaint":
                 anchor = _InpaintAnchor(latent)
                 if i > 0:
-                    anchor.head_from_tail(prev_video, prev_audio, C, bool(audio_context))
+                    anchor.head_from_tail(anchor_video, prev_audio, C, bool(audio_context))
                 if nxt is not None:
                     anchor.tail_from_head(nxt["video"], nxt["audio"], C, bool(audio_context))
                 latent, noise_mask = anchor.latent(), anchor.mask()
@@ -1352,13 +1450,13 @@ class H3LongTakeRender:
                 pos = "before" if before else "head"
                 keyframes = []
                 if i > 0:
-                    keyframes += motion_context_keyframes(prev_video, prev_audio, C, target_video, bool(audio_context), pos)
+                    keyframes += motion_context_keyframes(anchor_video, prev_audio, C, target_video, bool(audio_context), pos)
                 if nxt is not None:
                     keyframes += tail_context_keyframes(nxt["video"], nxt["audio"], C, target_video, bool(audio_context), pos)
                 if keyframes:
                     keyframes = (positive[0][1].get("minimax_keyframes") or []) + keyframes
                     positive = node_helpers.conditioning_set_values(positive, {"minimax_keyframes": keyframes})
-            del nxt
+            del nxt, anchor_video
 
             kf = positive[0][1].get("minimax_keyframes") or []
             n_guide = 1 if z_guide is not None else 0
@@ -1395,6 +1493,8 @@ class H3LongTakeRender:
             torch.save({"video": video_lat, "audio": audio_lat, "length": length, "ctx": ctx, "new": new},
                        latent_path)
             os.replace(mp4_path + ".tmp.mp4", mp4_path)
+            tones[i] = {"gen": _latent_tone(video_lat), "src": src_tone}
+            _save_tones(project_dir, tones)
 
             prev_video, prev_audio = video_lat, audio_lat
             prev_tail, prev_tail_src = images[-SEAM_ANALYSIS_FRAMES:].clone(), None
